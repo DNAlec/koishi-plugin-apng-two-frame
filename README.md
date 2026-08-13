@@ -171,7 +171,7 @@ IEND
 
 ## 许可证
 
-MIT。仓库的 `package.json` 已声明该许可证；正式发布前建议同时补充独立的 `LICENSE` 文件。
+MIT。仓库的 `package.json` 已声明该许可证，并包含独立的 `LICENSE` 文件。
 
 ## 反馈
 
