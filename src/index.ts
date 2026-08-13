@@ -4,6 +4,21 @@ import {} from 'koishi-plugin-puppeteer'
 import { createTwoFrameApng, downloadImage, ImageInputError } from './image'
 
 export const name = 'koishi-plugin-apng-two-frame'
+
+// Koishi 控制台会把 usage 作为 Markdown 渲染在插件配置页面上方。
+export const usage = `
+## 使用说明
+
+发送 \`apng\` 并附带两张图片，即可生成两帧 APNG 动图。也可以引用图片、@群成员获取头像，或在触发指令后分多条消息补齐图片。
+
+- 第一张图片用于聊天列表中的缩略图，第二张图片是点开后主要显示的画面。
+- 默认指令为 \`apng\`，也可以使用 \`两帧\` 或 \`两帧动图\`；修改下方的 \`commandName\` 后，主指令会随之改变。
+- 必须启用 \`puppeteer\` 服务；如需处理 GIF，还应启用可选的 \`ffmpeg\` 服务。
+- 缩略图差异主要面向 QQ + NapCat + OneBot 11，实际效果可能因平台和客户端版本而异。
+
+如果你已经部署了 [Meme Generator](https://github.com/MemeCrafters/meme-generator)，也可以安装并使用对应的更加轻量级的自定义表情：[\`apng_two_frame\`](https://github.com/DNAlec/memes/tree/master/apng_two_frame)。
+`
+
 // 图片地址通过 Koishi HTTP 服务下载；声明注入可确保服务缺失时插件不会半加载。
 export const inject = {
   required: ['http', 'puppeteer'],

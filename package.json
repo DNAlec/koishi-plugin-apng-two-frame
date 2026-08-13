@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-apng-two-frame",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "将两张图片合成为两帧 APNG 动图",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
@@ -29,7 +29,14 @@
     "url": "git+https://github.com/DNAlec/koishi-plugin-apng-two-frame.git"
   },
   "peerDependencies": {
-    "koishi": "^4.0.0"
+    "koishi": "^4.0.0",
+    "koishi-plugin-ffmpeg": "^1.1.0",
+    "koishi-plugin-puppeteer": "^3.9.0"
+  },
+  "peerDependenciesMeta": {
+    "koishi-plugin-ffmpeg": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "koishi": "^4.18.11",
