@@ -161,6 +161,24 @@ npm test
 
 测试覆盖 APNG chunk 顺序、CRC、帧延时、无限循环、浏览器 PNG 数据流复用、可选 FFmpeg 降级和消息取图顺序。
 
+## 发布
+
+仓库通过 GitHub Actions 和 npm Trusted Publishing 自动发布。维护者应先更新 `package.json` 与 `package-lock.json` 中的版本并提交，然后创建完全匹配的 `v<版本号>` 标签，例如：
+
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+工作流会验证标签与包版本一致，安装依赖、运行测试并发布到 npm。npm 包设置中的 Trusted Publisher 应配置为：
+
+- GitHub 用户或组织：`DNAlec`
+- 仓库：`koishi-plugin-apng-two-frame`
+- 工作流文件：`publish.yml`
+- 允许操作：`npm publish`
+
+该流程使用 GitHub OIDC 短期凭据，不需要在仓库中保存 `NPM_TOKEN`。
+
 ## 实现说明
 
 插件不再依赖 `sharp` 或 libvips。输入图片由 Puppeteer 中的浏览器图像解码器和 Canvas 完成 EXIF 转正、缩放、居中与 PNG 规范化，随后在 Node.js 中直接构造以下 PNG/APNG chunks：
