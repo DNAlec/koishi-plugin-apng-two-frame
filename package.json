@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-apng-two-frame",
-  "version": "0.0.1",
-  "description": "APNG 两帧处理插件",
+  "version": "1.0.0",
+  "description": "将两张图片合成为两帧 APNG 动图",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -15,9 +15,19 @@
   "keywords": [
     "koishi",
     "plugin",
-    "apng"
+    "apng",
+    "two-frame",
+    "表情包"
   ],
   "license": "MIT",
+  "contributors": [
+    "Alec <469405634@qq.com>"
+  ],
+  "homepage": "https://github.com/DNAlec/koishi-plugin-apng-two-frame",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DNAlec/koishi-plugin-apng-two-frame.git"
+  },
   "peerDependencies": {
     "koishi": "^4.0.0"
   },
@@ -27,5 +37,16 @@
   },
   "dependencies": {
     "sharp": "^0.34.5"
+  },
+  "koishi": {
+    "description": {
+      "zh": "将两张图片合成为两帧 APNG 动图：第一张作缩略图，点开后显示第二张",
+      "en": "Combine two images into a two-frame APNG: the first frame as thumbnail, the second shows when opened"
+    },
+    "service": {
+      "required": [
+        "http"
+      ]
+    }
   }
 }
