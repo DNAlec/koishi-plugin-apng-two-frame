@@ -1,6 +1,10 @@
 import { Context } from 'koishi'
-import sharp from 'sharp'
-import { encodeTwoFrameApng, RgbaFrame } from './apng'
+import {} from 'koishi-plugin-ffmpeg'
+import {} from 'koishi-plugin-puppeteer'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { encodeTwoFramePngs } from './apng'
 
 export class ImageInputError extends Error {}
 
@@ -53,87 +57,142 @@ export async function downloadImage(ctx: Context, url: string, maxBytes: number)
   return Buffer.concat(chunks, size)
 }
 
-async function normalizedMetadata(input: Buffer, maxDimension: number) {
-  let metadata: sharp.Metadata
-  try {
-    // metadata() 不会完整解压像素。先检查尺寸既能尽早拒绝超大图片，
-    // 也能向用户返回明确限制，而非 libvips 的通用 pixel-limit 错误。
-    // pages: 1 表示 GIF/APNG/WebP 等动图只读取第一帧。
-    metadata = await sharp(input, { pages: 1 }).metadata()
-  } catch {
-    throw new ImageInputError('图片损坏或格式不受支持')
+function imageMime(input: Buffer) {
+  if (input.length >= 6) {
+    const header = input.subarray(0, 6).toString('latin1')
+    if (header === 'GIF87a' || header === 'GIF89a') return 'image/gif'
   }
-  // autoOrient 是 sharp 根据 EXIF Orientation 计算出的显示尺寸。
-  // 例如横向像素但标记旋转 90° 的手机照片，宽高会在这里互换。
-  const rotated = metadata.autoOrient
-  const width = rotated.width ?? metadata.width
-  const height = rotated.height ?? metadata.height
-  if (!width || !height) throw new ImageInputError('无法读取图片尺寸')
-  if (width > maxDimension || height > maxDimension) {
-    throw new ImageInputError(`图片宽高不能超过 ${maxDimension} px`)
-  }
-  return { width, height }
+  if (input.length >= 8 && input.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png'
+  if (input.length >= 3 && input[0] === 0xff && input[1] === 0xd8 && input[2] === 0xff) return 'image/jpeg'
+  if (input.length >= 12 && input.toString('ascii', 0, 4) === 'RIFF' && input.toString('ascii', 8, 12) === 'WEBP') return 'image/webp'
+  if (input.length >= 2 && input.toString('ascii', 0, 2) === 'BM') return 'image/bmp'
+  return 'application/octet-stream'
 }
 
-async function toSecondFrame(input: Buffer, maxDimension: number): Promise<RgbaFrame> {
-  // 第二张图决定最终画布，除应用 EXIF 方向和统一 RGBA 色彩空间外不缩放、不裁切。
-  const { width, height } = await normalizedMetadata(input, maxDimension)
-  try {
-    const { data, info } = await sharp(input, { pages: 1, limitInputPixels: maxDimension * maxDimension })
-      .rotate() // 无参数 rotate() 表示应用 EXIF Orientation 并移除方向标记。
-      .ensureAlpha()
-      .toColourspace('srgb')
-      .raw()
-      .toBuffer({ resolveWithObject: true })
-    return { width: info.width || width, height: info.height || height, data }
-  } catch {
-    throw new ImageInputError('图片解码失败')
-  }
-}
+async function staticBrowserInput(ctx: Context, input: Buffer) {
+  const mime = imageMime(input)
+  if (mime !== 'image/gif') return { data: input.toString('base64'), mime }
+  if (!ctx.ffmpeg) throw new ImageInputError('GIF 图片需要启用 ffmpeg 服务，或请先转换为 PNG/JPEG')
 
-async function toFirstFrame(input: Buffer, width: number, height: number, maxDimension: number): Promise<RgbaFrame> {
-  // 第一张图适配第二张图的画布：保持比例、只缩小不放大、透明区域铺成白色。
-  await normalizedMetadata(input, maxDimension)
+  const directory = await mkdtemp(join(tmpdir(), 'koishi-apng-'))
+  const source = join(directory, 'input.gif')
+  const output = join(directory, 'frame.png')
   try {
-    const { data, info } = await sharp(input, { pages: 1, limitInputPixels: maxDimension * maxDimension })
-      .rotate()
-      .resize(width, height, {
-        fit: 'contain', // 完整保留图片内容，不裁切。
-        withoutEnlargement: true,
-        background: { r: 255, g: 255, b: 255, alpha: 1 },
-      })
-      .extend({
-        // 这里的零扩展用于固定 sharp 操作链的输出语义；真正不足画布的情况
-        // 会在下方创建精确尺寸的白色画布并居中合成。
-        top: 0,
-        bottom: 0,
-        left: 0,
-        right: 0,
-      })
-      .flatten({ background: { r: 255, g: 255, b: 255 } })
-      .ensureAlpha()
-      .toColourspace('srgb')
-      .raw()
-      .toBuffer({ resolveWithObject: true })
-
-    // 当原图小于目标画布且禁止放大时，contain 可能返回小于目标的结果。
-    // 此时显式创建目标画布再居中贴入，确保两帧尺寸完全相同。
-    if (info.width === width && info.height === height) return { width, height, data }
-    const canvas = await sharp({
-      create: { width, height, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } },
-    }).composite([{ input: data, raw: { width: info.width, height: info.height, channels: 4 }, gravity: 'centre' }])
-      .raw()
-      .toBuffer()
-    return { width, height, data: canvas }
+    await writeFile(source, input)
+    const builder = ctx.ffmpeg.builder().input(source)
+    builder.outputOption('-vframes', '1')
+    builder.outputOption('-f', 'image2')
+    builder.outputOption('-c:v', 'png')
+    builder.outputOption('-update', '1')
+    builder.outputOption('-pix_fmt', 'rgba')
+    await builder.run('file', output)
+    return { data: (await readFile(output)).toString('base64'), mime: 'image/png' }
   } catch (error) {
     if (error instanceof ImageInputError) throw error
-    throw new ImageInputError('图片解码失败')
+    throw new ImageInputError('GIF 第一帧提取失败')
+  } finally {
+    await rm(directory, { recursive: true, force: true })
   }
 }
 
-export async function createTwoFrameApng(firstInput: Buffer, secondInput: Buffer, maxDimension: number) {
-  // 必须先处理第二张图，才能知道第一张图要适配的画布尺寸。
-  const second = await toSecondFrame(secondInput, maxDimension)
-  const first = await toFirstFrame(firstInput, second.width, second.height, maxDimension)
-  return encodeTwoFrameApng(first, second)
+interface CanvasResult {
+  first: string
+  second: string
+}
+
+export async function createTwoFrameApng(ctx: Context, firstInput: Buffer, secondInput: Buffer, maxDimension: number) {
+  const [first, second] = await Promise.all([
+    staticBrowserInput(ctx, firstInput),
+    staticBrowserInput(ctx, secondInput),
+  ])
+  const page = await ctx.puppeteer.page()
+  try {
+    const result = await page.evaluate(async ({ first, second, maxDimension }) => {
+      function decodeBase64(value: string) {
+        const binary = atob(value)
+        const bytes = new Uint8Array(binary.length)
+        for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index)
+        return bytes
+      }
+
+      async function loadImage(source: { data: string, mime: string }): Promise<ImageBitmap | HTMLImageElement> {
+        const blob = new Blob([decodeBase64(source.data)], { type: source.mime })
+        if (typeof createImageBitmap === 'function') return createImageBitmap(blob, { imageOrientation: 'from-image' })
+        return new Promise((resolve, reject) => {
+          const url = URL.createObjectURL(blob)
+          const image = new Image()
+          image.onload = () => {
+            URL.revokeObjectURL(url)
+            resolve(image)
+          }
+          image.onerror = () => {
+            URL.revokeObjectURL(url)
+            reject(new Error('图片损坏或格式不受支持'))
+          }
+          image.src = url
+        })
+      }
+
+      function dimensions(image: ImageBitmap | HTMLImageElement) {
+        return {
+          width: 'naturalWidth' in image ? image.naturalWidth : image.width,
+          height: 'naturalHeight' in image ? image.naturalHeight : image.height,
+        }
+      }
+
+      function checkSize(image: ImageBitmap | HTMLImageElement) {
+        const size = dimensions(image)
+        if (!size.width || !size.height) throw new Error('无法读取图片尺寸')
+        if (size.width > maxDimension || size.height > maxDimension) {
+          throw new Error(`图片宽高不能超过 ${maxDimension} px`)
+        }
+        return size
+      }
+
+      const [firstImage, secondImage] = await Promise.all([loadImage(first), loadImage(second)])
+      try {
+        const firstSize = checkSize(firstImage)
+        const secondSize = checkSize(secondImage)
+        const makeCanvas = () => {
+          const canvas = document.createElement('canvas')
+          canvas.width = secondSize.width
+          canvas.height = secondSize.height
+          return canvas
+        }
+
+        // 第二张图决定画布，保留透明通道且不缩放。
+        const secondCanvas = makeCanvas()
+        secondCanvas.getContext('2d')!.drawImage(secondImage, 0, 0)
+
+        // 第一张图保持比例、只缩小不放大，并在白色画布上居中。
+        const firstCanvas = makeCanvas()
+        const context = firstCanvas.getContext('2d')!
+        context.fillStyle = '#ffffff'
+        context.fillRect(0, 0, firstCanvas.width, firstCanvas.height)
+        const scale = Math.min(1, firstCanvas.width / firstSize.width, firstCanvas.height / firstSize.height)
+        const width = Math.max(1, Math.round(firstSize.width * scale))
+        const height = Math.max(1, Math.round(firstSize.height * scale))
+        const x = Math.round((firstCanvas.width - width) / 2)
+        const y = Math.round((firstCanvas.height - height) / 2)
+        context.drawImage(firstImage, x, y, width, height)
+
+        const stripPrefix = (url: string) => url.slice(url.indexOf(',') + 1)
+        return {
+          first: stripPrefix(firstCanvas.toDataURL('image/png')),
+          second: stripPrefix(secondCanvas.toDataURL('image/png')),
+        }
+      } finally {
+        if ('close' in firstImage) firstImage.close()
+        if ('close' in secondImage) secondImage.close()
+      }
+    }, { first, second, maxDimension }) as CanvasResult
+    return encodeTwoFramePngs(Buffer.from(result.first, 'base64'), Buffer.from(result.second, 'base64'))
+  } catch (error) {
+    if (error instanceof ImageInputError) throw error
+    const message = error instanceof Error ? error.message : String(error)
+    if (/图片|px/.test(message)) throw new ImageInputError(message)
+    throw new ImageInputError('图片解码或处理失败')
+  } finally {
+    await page.close()
+  }
 }

@@ -20,11 +20,18 @@
 
 ## 安装
 
-发布到 npm 后，可以在 Koishi 插件市场搜索 `apng-two-frame` 安装，或在 Koishi 应用目录运行：
+可以在 Koishi 插件市场搜索 `apng-two-frame` 安装，或在 Koishi 应用目录运行：
 
 ```bash
 npm install koishi-plugin-apng-two-frame
 ```
+
+运行依赖：
+
+- **必需：** 启用 Koishi 的 `puppeteer` 服务，由浏览器负责图片解码和 Canvas 处理；
+- **可选：** 启用 Koishi 的 `ffmpeg` 服务，用于可靠地提取 GIF 第一帧；
+- 未启用 FFmpeg 时，插件仍可处理其他受浏览器支持的图片格式，但收到 GIF 会返回明确提示；
+- 插件本身不再依赖 `sharp` 或 libvips。
 
 从源码开发时：
 
@@ -105,7 +112,8 @@ apng @成员A @成员B
 
 - 支持适配器提供的消息图片和成员头像；
 - 不解析消息中的普通文本 URL；
-- GIF、APNG 和动态 WebP 等动图只读取第一帧；
+- PNG、JPEG、WebP、BMP 和 APNG 等格式由 Chromium 解码，实际支持范围取决于所使用的浏览器版本；
+- APNG 和动态 WebP 等动图由浏览器读取静态帧；GIF 使用可选的 FFmpeg 服务提取第一帧；
 - 自动应用手机照片的 EXIF Orientation；
 - 通过流式下载执行文件大小限制，避免完整下载超限文件；
 - 拒绝损坏图片、不支持的格式以及超过尺寸限制的图片。
@@ -132,7 +140,8 @@ apng @成员A @成员B
 
 - Node.js 18.17 或更高版本；
 - Koishi 4；
-- 支持当前平台的 `sharp` 预编译包或本地构建环境。
+- 已安装并启用 `koishi-plugin-puppeteer`；
+- 如需处理 GIF，安装并启用 `koishi-plugin-ffmpeg`。
 
 常用命令：
 
@@ -150,11 +159,11 @@ npm run dev
 npm test
 ```
 
-测试覆盖 APNG chunk 顺序、CRC、帧延时、无限循环、像素内容、画布适配、透明背景、EXIF 转正、异常图片和消息取图顺序。
+测试覆盖 APNG chunk 顺序、CRC、帧延时、无限循环、浏览器 PNG 数据流复用、可选 FFmpeg 降级和消息取图顺序。
 
 ## 实现说明
 
-插件没有依赖外部 APNG 编码服务。输入图片由 `sharp` 解码和归一化，随后在 Node.js 中直接构造以下 PNG/APNG chunks：
+插件不再依赖 `sharp` 或 libvips。输入图片由 Puppeteer 中的浏览器图像解码器和 Canvas 完成 EXIF 转正、缩放、居中与 PNG 规范化，随后在 Node.js 中直接构造以下 PNG/APNG chunks：
 
 ```text
 PNG Signature
@@ -167,7 +176,15 @@ fdAT (第二帧像素)
 IEND
 ```
 
-所有 chunk 均生成正确的长度、动画序号和 CRC-32。源码中包含对应格式和处理流程的中文注释。
+编码器直接复用 Canvas 导出 PNG 的 IDAT 压缩流，避免通过 Puppeteer 传输完整 RGBA 像素。所有 chunk 均生成正确的长度、动画序号和 CRC-32。源码中包含对应格式和处理流程的中文注释。
+
+本插件没有生产 npm 依赖，当前发布包压缩后约 20 KB。Puppeteer 和 FFmpeg 通过 Koishi 服务复用，不会作为本插件的生产依赖打包；其中 Puppeteer 仍需要运行环境提供 Chrome 或 Chromium。
+
+## 致谢与参考实现
+
+移除 `sharp` 的浏览器图像处理方案参考了 [koishi-plugin-patina 的 APNG 实现](https://github.com/koishi-shangxue-plugins/koishi-shangxue-apps/blob/907c3247ebd9c4433fe1fb2ca69ff9ca9f4612f6/plugins/patina/html/apng/apng.html)，原作者为 [shangxueink](https://github.com/shangxueink)。
+
+参考项目采用 MIT 许可证。本插件在其思路基础上进行了适配：保留纯 Node.js APNG 编码器，并直接复用 Canvas 导出 PNG 的压缩数据流。
 
 ## 许可证
 

@@ -1,8 +1,7 @@
 const assert = require('node:assert/strict')
-const { inflateSync } = require('node:zlib')
+const { deflateSync, inflateSync } = require('node:zlib')
 const test = require('node:test')
-const sharp = require('sharp')
-const { crc32, createTwoFrameApng, encodeTwoFrameApng } = require('../lib')
+const { crc32, createTwoFrameApng, encodeTwoFrameApng, encodeTwoFramePngs } = require('../lib')
 
 function parsePng(buffer) {
   assert.deepEqual(buffer.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
@@ -30,6 +29,31 @@ function rawRows(compressed, width, height) {
   return Buffer.concat(rows)
 }
 
+function pngChunk(type, data = Buffer.alloc(0)) {
+  const name = Buffer.from(type)
+  const length = Buffer.alloc(4)
+  length.writeUInt32BE(data.length)
+  const checksum = Buffer.alloc(4)
+  checksum.writeUInt32BE(crc32(Buffer.concat([name, data])))
+  return Buffer.concat([length, name, data, checksum])
+}
+
+function staticPng(width, height, rgba) {
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(width, 0)
+  ihdr.writeUInt32BE(height, 4)
+  ihdr[8] = 8
+  ihdr[9] = 6
+  const rows = Buffer.alloc((width * 4 + 1) * height)
+  for (let y = 0; y < height; y++) rgba.copy(rows, y * (width * 4 + 1) + 1, y * width * 4, (y + 1) * width * 4)
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(rows)),
+    pngChunk('IEND'),
+  ])
+}
+
 test('encodes a valid two-frame APNG with exact timing and CRCs', () => {
   const first = { width: 1, height: 1, data: Buffer.from([255, 0, 0, 255]) }
   const second = { width: 1, height: 1, data: Buffer.from([0, 0, 255, 255]) }
@@ -48,38 +72,23 @@ test('encodes a valid two-frame APNG with exact timing and CRCs', () => {
   assert.deepEqual(rawRows(chunks[5].data.subarray(4), 1, 1), second.data)
 })
 
-test('uses second image as canvas and centres a non-enlarged first image on white', async () => {
-  const first = await sharp({ create: { width: 2, height: 1, channels: 4, background: '#ff0000' } }).png().toBuffer()
-  const second = await sharp({ create: { width: 4, height: 4, channels: 4, background: '#0000ff' } }).png().toBuffer()
-  const chunks = parsePng(await createTwoFrameApng(first, second, 4096))
-  const frame1 = rawRows(chunks.find(chunk => chunk.type === 'IDAT').data, 4, 4)
-  const frame2 = rawRows(chunks.find(chunk => chunk.type === 'fdAT').data.subarray(4), 4, 4)
-  const pixel = (data, x, y) => [...data.subarray((y * 4 + x) * 4, (y * 4 + x + 1) * 4)]
-
-  assert.deepEqual(pixel(frame1, 0, 0), [255, 255, 255, 255])
-  assert.deepEqual(pixel(frame1, 1, 1), [255, 0, 0, 255])
-  assert.deepEqual(pixel(frame1, 2, 1), [255, 0, 0, 255])
-  assert.deepEqual(pixel(frame1, 3, 3), [255, 255, 255, 255])
-  assert.deepEqual(pixel(frame2, 0, 0), [0, 0, 255, 255])
+test('reuses browser-generated PNG streams as two APNG frames', () => {
+  const firstPixels = Buffer.from([255, 255, 255, 255, 255, 0, 0, 255])
+  const secondPixels = Buffer.from([0, 0, 255, 255, 0, 255, 0, 128])
+  const chunks = parsePng(encodeTwoFramePngs(
+    staticPng(2, 1, firstPixels),
+    staticPng(2, 1, secondPixels),
+  ))
+  assert.deepEqual(rawRows(chunks.find(chunk => chunk.type === 'IDAT').data, 2, 1), firstPixels)
+  assert.deepEqual(rawRows(chunks.find(chunk => chunk.type === 'fdAT').data.subarray(4), 2, 1), secondPixels)
 })
 
-test('auto-orients input and composites transparent first-frame pixels onto white', async () => {
-  const transparent = await sharp({
-    create: { width: 1, height: 1, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
-  }).png().toBuffer()
-  const oriented = await sharp({ create: { width: 3, height: 2, channels: 3, background: '#00ff00' } })
-    .jpeg()
-    .withMetadata({ orientation: 6 })
-    .toBuffer()
-  const chunks = parsePng(await createTwoFrameApng(transparent, oriented, 4096))
-  const ihdr = chunks.find(chunk => chunk.type === 'IHDR').data
-  assert.deepEqual([ihdr.readUInt32BE(0), ihdr.readUInt32BE(4)], [2, 3])
-  const frame1 = rawRows(chunks.find(chunk => chunk.type === 'IDAT').data, 2, 3)
-  assert.deepEqual([...frame1.subarray(0, 4)], [255, 255, 255, 255])
+test('rejects mismatched browser PNG dimensions', () => {
+  const pixel = Buffer.from([0, 0, 0, 255])
+  assert.throws(() => encodeTwoFramePngs(staticPng(1, 1, pixel), staticPng(2, 1, Buffer.concat([pixel, pixel]))), /尺寸/)
 })
 
-test('rejects invalid and oversized dimensions', async () => {
-  const valid = await sharp({ create: { width: 2, height: 2, channels: 3, background: '#000' } }).png().toBuffer()
-  await assert.rejects(() => createTwoFrameApng(Buffer.from('not an image'), valid, 4096), /图片/)
-  await assert.rejects(() => createTwoFrameApng(valid, valid, 1), /不能超过 1 px/)
+test('requires optional ffmpeg service for GIF input', async () => {
+  const gif = Buffer.from('GIF89a', 'ascii')
+  await assert.rejects(() => createTwoFrameApng({}, gif, gif, 4096), /ffmpeg/)
 })

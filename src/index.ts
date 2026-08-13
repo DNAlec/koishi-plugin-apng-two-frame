@@ -1,9 +1,14 @@
 import { Context, h, Schema, Session } from 'koishi'
+import {} from 'koishi-plugin-ffmpeg'
+import {} from 'koishi-plugin-puppeteer'
 import { createTwoFrameApng, downloadImage, ImageInputError } from './image'
 
 export const name = 'koishi-plugin-apng-two-frame'
 // 图片地址通过 Koishi HTTP 服务下载；声明注入可确保服务缺失时插件不会半加载。
-export const inject = ['http']
+export const inject = {
+  required: ['http', 'puppeteer'],
+  optional: ['ffmpeg'],
+}
 
 const aliases = ['两帧', '两帧动图']
 
@@ -97,7 +102,7 @@ async function generate(ctx: Context, session: Session, sources: string[], confi
     // 两张图可以并行下载；编码仍按 sources 的既定顺序使用结果。
     const maxBytes = config.maxFileSize * 1024 * 1024
     const [first, second] = await Promise.all(sources.slice(0, 2).map(source => downloadImage(ctx, source, maxBytes)))
-    const output = await createTwoFrameApng(first, second, config.maxDimension)
+    const output = await createTwoFrameApng(ctx, first, second, config.maxDimension)
     // OneBot 适配器会将 data:image/png;base64 转成 NapCat 可接受的 base64:// 图片。
     await session.send(h.image(output, 'image/png'))
   } catch (error) {
@@ -205,4 +210,4 @@ export function apply(ctx: Context, config: Config) {
 }
 
 export { createTwoFrameApng, downloadImage } from './image'
-export { encodeTwoFrameApng, crc32 } from './apng'
+export { encodeTwoFrameApng, encodeTwoFramePngs, crc32 } from './apng'

@@ -40,7 +40,7 @@ function uint32(value: number) {
   return data
 }
 
-function chunk(type: string, data = Buffer.alloc(0)) {
+function chunk(type: string, data: Buffer = Buffer.alloc(0)) {
   // PNG chunk 布局：data length(4) + type(4) + data(n) + CRC(4)。
   // CRC 的计算范围只包含 type 与 data，不包含 length 和 CRC 本身。
   const name = Buffer.from(type, 'ascii')
@@ -60,6 +60,71 @@ function frameControl(sequence: number, width: number, height: number, numerator
   data.writeUInt16BE(numerator, 20)
   data.writeUInt16BE(denominator, 22)
   return chunk('fcTL', data)
+}
+
+interface ParsedPng {
+  ihdr: Buffer
+  width: number
+  height: number
+  imageData: Buffer
+}
+
+function parseStaticPng(input: Buffer): ParsedPng {
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+  if (input.length < signature.length || !input.subarray(0, 8).equals(signature)) {
+    throw new Error('浏览器没有生成有效的 PNG')
+  }
+
+  let offset = 8
+  let ihdr: Buffer | undefined
+  const idat: Buffer[] = []
+  while (offset + 12 <= input.length) {
+    const length = input.readUInt32BE(offset)
+    const dataStart = offset + 8
+    const dataEnd = dataStart + length
+    if (dataEnd + 4 > input.length) throw new Error('浏览器生成的 PNG 数据不完整')
+    const type = input.toString('ascii', offset + 4, dataStart)
+    if (type === 'IHDR') ihdr = input.subarray(dataStart, dataEnd)
+    if (type === 'IDAT') idat.push(input.subarray(dataStart, dataEnd))
+    offset = dataEnd + 4
+    if (type === 'IEND') break
+  }
+
+  if (ihdr?.length !== 13 || !idat.length) throw new Error('浏览器生成的 PNG 缺少必要数据')
+  return {
+    ihdr,
+    width: ihdr.readUInt32BE(0),
+    height: ihdr.readUInt32BE(4),
+    imageData: Buffer.concat(idat),
+  }
+}
+
+/**
+ * 将浏览器 Canvas 导出的两张同尺寸 PNG 组合为两帧 APNG。
+ *
+ * Canvas 已经完成解码、方向校正、缩放和颜色转换；这里复用 PNG 自带的
+ * zlib 数据流，避免把大块 RGBA 像素通过 Puppeteer 协议传回 Node.js。
+ */
+export function encodeTwoFramePngs(firstInput: Buffer, secondInput: Buffer) {
+  const first = parseStaticPng(firstInput)
+  const second = parseStaticPng(secondInput)
+  if (first.width !== second.width || first.height !== second.height) throw new Error('两帧尺寸必须一致')
+  // 两帧共用同一 IHDR，因此位深、颜色类型、压缩、滤波及交错方式也必须一致。
+  if (!first.ihdr.subarray(8).equals(second.ihdr.subarray(8))) throw new Error('两帧 PNG 格式必须一致')
+
+  const actl = Buffer.alloc(8)
+  actl.writeUInt32BE(2, 0)
+  actl.writeUInt32BE(0, 4)
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    chunk('IHDR', first.ihdr),
+    chunk('acTL', actl),
+    frameControl(0, first.width, first.height, 10, 1000),
+    chunk('IDAT', first.imageData),
+    frameControl(1, second.width, second.height, 999, 1),
+    chunk('fdAT', Buffer.concat([uint32(2), second.imageData])),
+    chunk('IEND'),
+  ])
 }
 
 function compressRgba(frame: RgbaFrame) {
