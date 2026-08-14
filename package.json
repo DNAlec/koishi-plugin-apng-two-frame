@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-apng-two-frame",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "将两张图片合成为两帧 APNG 动图",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",

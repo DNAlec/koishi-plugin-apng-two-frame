@@ -99,6 +99,17 @@ apng @成员A @成员B
 - 发送完全匹配的 `取消` 可以结束当前任务；
 - 超过配置的等待时间后任务会自动取消。
 
+### 批量生成
+
+在配置中开启 `enableBatchCommand` 后，可使用子指令：
+
+```text
+apng.batch
+apng.批量
+```
+
+批量模式不会在收到 2 张图片时立即处理。它会继续收集，直到达到 `batchMaxImages` 设定的上限，或用户在至少收集 2 张后发送完全匹配的“开始”。执行时，第一张图作为每个结果的第一帧，其余每张图分别作为第二帧，因此收集 N 张图会最多生成 N - 1 张 APNG。
+
 ## 配置
 
 | 配置项 | 类型 | 默认值 | 范围 | 说明 |
@@ -107,6 +118,8 @@ apng @成员A @成员B
 | `maxFileSize` | `number` | `10` | 1–100 | 单张图片大小上限，单位 MiB |
 | `maxDimension` | `number` | `4096` | 64–16384 | 输入图片宽或高的最大像素数 |
 | `collectTimeout` | `number` | `60` | 5–3600 | 等待后续图片的超时时间，单位秒 |
+| `enableBatchCommand` | `boolean` | `false` | — | 是否启用 `batch`（批量）子指令 |
+| `batchMaxImages` | `number` | `10` | 2–100 | 批量任务收集上限，包含第一张公用图 |
 
 ## 输入处理
 
@@ -118,7 +131,7 @@ apng @成员A @成员B
 - 通过流式下载执行文件大小限制，避免完整下载超限文件；
 - 拒绝损坏图片、不支持的格式以及超过尺寸限制的图片。
 
-当一条消息提供超过两张图片时，仅使用按优先级排序后的前两张：
+普通模式下，当一条消息提供超过两张图片时，仅使用按优先级排序后的前两张；批量模式则使用前 `batchMaxImages` 张：
 
 1. 引用消息中的图片和 @头像，按照元素顺序；
 2. 当前指令消息中的图片和 @头像，按照元素顺序；
@@ -159,15 +172,15 @@ npm run dev
 npm test
 ```
 
-测试覆盖 APNG chunk 顺序、CRC、帧延时、无限循环、浏览器 PNG 数据流复用、可选 FFmpeg 降级和消息取图顺序。
+测试覆盖 APNG chunk 顺序、CRC、帧延时、无限循环、浏览器 PNG 数据流复用、可选 FFmpeg 降级、消息取图顺序、批量子指令开关和并发消息串行收集。
 
 ## 发布
 
 仓库通过 GitHub Actions 和 npm Trusted Publishing 自动发布。维护者应先更新 `package.json` 与 `package-lock.json` 中的版本并提交，然后创建完全匹配的 `v<版本号>` 标签，例如：
 
 ```bash
-git tag v1.0.1
-git push origin v1.0.1
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
 工作流会验证标签与包版本一致，安装依赖、运行测试并发布到 npm。npm 包设置中的 Trusted Publisher 应配置为：
