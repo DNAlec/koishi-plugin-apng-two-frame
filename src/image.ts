@@ -12,49 +12,70 @@ function sizeError(maxBytes: number) {
   return new ImageInputError(`图片文件超过 ${(maxBytes / 1024 / 1024).toFixed(1)} MiB 限制`)
 }
 
-export async function downloadImage(ctx: Context, url: string, maxBytes: number) {
+export type DebugLog = (message: string, extra?: unknown) => void
+
+function summarizeUrl(url: string) {
+  if (url.startsWith('data:') && url.length > 64) return `${url.slice(0, 48)}...(${url.length} chars)`
+  return url
+}
+
+export async function downloadImage(ctx: Context, url: string, maxBytes: number, debug: DebugLog = () => {}) {
   // Koishi/Satori 可能把消息图片表示成 data URL。先按 base64 长度预估，
   // 可避免在已知超限时仍分配一块巨大的解码 Buffer。
   const dataMatch = /^data:([\w/.+-]+);base64,(.*)$/s.exec(url)
   if (dataMatch) {
     const padding = dataMatch[2].endsWith('==') ? 2 : dataMatch[2].endsWith('=') ? 1 : 0
     const approximateSize = Math.floor(dataMatch[2].length * 3 / 4) - padding
+    debug('下载 data URL', { mime: dataMatch[1], approximateSize, maxBytes })
     if (approximateSize > maxBytes) throw sizeError(maxBytes)
     const data = Buffer.from(dataMatch[2], 'base64')
     if (data.length > maxBytes) throw sizeError(maxBytes)
+    debug('data URL 解码完成', { bytes: data.length })
     return data
   }
 
   // 用户输入的普通文本 URL 不会进入此函数；这里只下载适配器提供的图片/头像地址。
   // file: 等本地协议不被接受，避免消息触发任意本地文件读取。
   if (!/^https?:\/\//i.test(url)) throw new ImageInputError('不支持的图片地址')
-  const response = await ctx.http(url, {
-    responseType: 'stream',
-    timeout: 30_000,
-  })
-  // Content-Length 只能作为快速拒绝依据，服务端可能不提供或谎报，
-  // 因此下面仍需在读取每个数据块时累计真实字节数。
-  const declaredSize = Number(response.headers.get('content-length'))
-  if (Number.isFinite(declaredSize) && declaredSize > maxBytes) throw sizeError(maxBytes)
-
-  const reader = response.data.getReader()
-  const chunks: Buffer[] = []
-  let size = 0
+  debug('开始 HTTP 下载', { url: summarizeUrl(url), maxBytes })
   try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      size += value.byteLength
-      if (size > maxBytes) {
-        await reader.cancel()
-        throw sizeError(maxBytes)
+    const response = await ctx.http(url, {
+      responseType: 'stream',
+      timeout: 30_000,
+    })
+    // Content-Length 只能作为快速拒绝依据，服务端可能不提供或谎报，
+    // 因此下面仍需在读取每个数据块时累计真实字节数。
+    const declaredSize = Number(response.headers.get('content-length'))
+    debug('HTTP 响应头', {
+      status: (response as { status?: number }).status,
+      contentType: response.headers.get('content-type'),
+      contentLength: response.headers.get('content-length'),
+    })
+    if (Number.isFinite(declaredSize) && declaredSize > maxBytes) throw sizeError(maxBytes)
+
+    const reader = response.data.getReader()
+    const chunks: Buffer[] = []
+    let size = 0
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        size += value.byteLength
+        if (size > maxBytes) {
+          await reader.cancel()
+          throw sizeError(maxBytes)
+        }
+        chunks.push(Buffer.from(value))
       }
-      chunks.push(Buffer.from(value))
+    } finally {
+      reader.releaseLock()
     }
-  } finally {
-    reader.releaseLock()
+    debug('HTTP 下载完成', { bytes: size })
+    return Buffer.concat(chunks, size)
+  } catch (error) {
+    debug('HTTP 下载失败', error)
+    throw error
   }
-  return Buffer.concat(chunks, size)
 }
 
 function imageMime(input: Buffer) {
