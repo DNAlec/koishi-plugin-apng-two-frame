@@ -72,7 +72,7 @@ interface ParsedPng {
 function parseStaticPng(input: Buffer): ParsedPng {
   const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
   if (input.length < signature.length || !input.subarray(0, 8).equals(signature)) {
-    throw new Error('浏览器没有生成有效的 PNG')
+    throw new Error('不是有效的 PNG')
   }
 
   let offset = 8
@@ -82,7 +82,7 @@ function parseStaticPng(input: Buffer): ParsedPng {
     const length = input.readUInt32BE(offset)
     const dataStart = offset + 8
     const dataEnd = dataStart + length
-    if (dataEnd + 4 > input.length) throw new Error('浏览器生成的 PNG 数据不完整')
+    if (dataEnd + 4 > input.length) throw new Error('PNG 数据不完整')
     const type = input.toString('ascii', offset + 4, dataStart)
     if (type === 'IHDR') ihdr = input.subarray(dataStart, dataEnd)
     if (type === 'IDAT') idat.push(input.subarray(dataStart, dataEnd))
@@ -90,13 +90,71 @@ function parseStaticPng(input: Buffer): ParsedPng {
     if (type === 'IEND') break
   }
 
-  if (ihdr?.length !== 13 || !idat.length) throw new Error('浏览器生成的 PNG 缺少必要数据')
+  if (ihdr?.length !== 13 || !idat.length) throw new Error('PNG 缺少必要数据')
   return {
     ihdr,
     width: ihdr.readUInt32BE(0),
     height: ihdr.readUInt32BE(4),
     imageData: Buffer.concat(idat),
   }
+}
+
+export interface PngAnimationFrame {
+  /** 完整的静态 PNG 文件。 */
+  data: Buffer
+  /** APNG 延时分子，实际时长为 numerator / denominator 秒。 */
+  delayNumerator: number
+  /** APNG 延时分母。 */
+  delayDenominator: number
+}
+
+function delay16(value: number) {
+  // fcTL 的 delay_num / delay_den 都是 16 位无符号整数。
+  return Math.min(65535, Math.max(0, Math.round(value)))
+}
+
+/**
+ * 将若干同尺寸静态 PNG 组合为 APNG。
+ *
+ * 复用每张 PNG 自带的 IDAT zlib 数据流，避免再次压缩像素。
+ * 第一帧写入 IDAT，后续帧写入 fdAT；播放次数为 0 表示无限循环。
+ */
+export function encodePngFrames(frames: PngAnimationFrame[], plays = 0) {
+  if (!frames.length) throw new Error('至少需要一帧')
+  const parsed = frames.map((frame) => ({
+    ...parseStaticPng(frame.data),
+    delayNumerator: delay16(frame.delayNumerator),
+    delayDenominator: delay16(frame.delayDenominator),
+  }))
+  const first = parsed[0]
+  for (const frame of parsed) {
+    if (frame.width !== first.width || frame.height !== first.height) throw new Error('各帧尺寸必须一致')
+    // 各帧共用同一 IHDR，因此位深、颜色类型、压缩、滤波及交错方式也必须一致。
+    if (!frame.ihdr.subarray(8).equals(first.ihdr.subarray(8))) throw new Error('各帧 PNG 格式必须一致')
+  }
+
+  const actl = Buffer.alloc(8)
+  actl.writeUInt32BE(parsed.length, 0)
+  actl.writeUInt32BE(plays >>> 0, 4)
+  const parts = [
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    chunk('IHDR', first.ihdr),
+    chunk('acTL', actl),
+  ]
+
+  // fcTL 与 fdAT 共用一套递增序号；默认图像的 IDAT 本身不占序号。
+  let sequence = 0
+  for (let index = 0; index < parsed.length; index++) {
+    const frame = parsed[index]
+    parts.push(frameControl(sequence++, frame.width, frame.height, frame.delayNumerator, frame.delayDenominator))
+    if (index === 0) {
+      parts.push(chunk('IDAT', frame.imageData))
+    } else {
+      parts.push(chunk('fdAT', Buffer.concat([uint32(sequence++), frame.imageData])))
+    }
+  }
+  parts.push(chunk('IEND'))
+  return Buffer.concat(parts)
 }
 
 /**
@@ -106,24 +164,9 @@ function parseStaticPng(input: Buffer): ParsedPng {
  * zlib 数据流，避免把大块 RGBA 像素通过 Puppeteer 协议传回 Node.js。
  */
 export function encodeTwoFramePngs(firstInput: Buffer, secondInput: Buffer) {
-  const first = parseStaticPng(firstInput)
-  const second = parseStaticPng(secondInput)
-  if (first.width !== second.width || first.height !== second.height) throw new Error('两帧尺寸必须一致')
-  // 两帧共用同一 IHDR，因此位深、颜色类型、压缩、滤波及交错方式也必须一致。
-  if (!first.ihdr.subarray(8).equals(second.ihdr.subarray(8))) throw new Error('两帧 PNG 格式必须一致')
-
-  const actl = Buffer.alloc(8)
-  actl.writeUInt32BE(2, 0)
-  actl.writeUInt32BE(0, 4)
-  return Buffer.concat([
-    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
-    chunk('IHDR', first.ihdr),
-    chunk('acTL', actl),
-    frameControl(0, first.width, first.height, 10, 1000),
-    chunk('IDAT', first.imageData),
-    frameControl(1, second.width, second.height, 999, 1),
-    chunk('fdAT', Buffer.concat([uint32(2), second.imageData])),
-    chunk('IEND'),
+  return encodePngFrames([
+    { data: firstInput, delayNumerator: 10, delayDenominator: 1000 },
+    { data: secondInput, delayNumerator: 999, delayDenominator: 1 },
   ])
 }
 

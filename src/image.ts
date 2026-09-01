@@ -1,15 +1,26 @@
-import { Context } from 'koishi'
-import {} from 'koishi-plugin-ffmpeg'
+import { Context, h, Session } from 'koishi'
 import {} from 'koishi-plugin-puppeteer'
+import './ffmpeg'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { encodeTwoFramePngs } from './apng'
+
+export type ImageSendMode = 'auto' | 'file' | 'base64'
+
+export interface ImageSendOptions {
+  mode: ImageSendMode
+  /** auto 模式下超过该 KiB 改用临时文件发送。 */
+  thresholdKiB: number
+  /** 超过该字节数改为以文件附件发送；0 表示不启用。 */
+  fileThresholdBytes: number
+}
 
 export class ImageInputError extends Error {}
 
-function sizeError(maxBytes: number) {
-  return new ImageInputError(`图片文件超过 ${(maxBytes / 1024 / 1024).toFixed(1)} MiB 限制`)
+function sizeError(maxBytes: number, kind: string) {
+  return new ImageInputError(`${kind}文件超过 ${(maxBytes / 1024 / 1024).toFixed(1)} MiB 限制`)
 }
 
 export type DebugLog = (message: string, extra?: unknown) => void
@@ -20,28 +31,144 @@ function summarizeUrl(url: string) {
 }
 
 export async function downloadImage(ctx: Context, url: string, maxBytes: number, debug: DebugLog = () => {}) {
-  // Koishi/Satori 可能把消息图片表示成 data URL。先按 base64 长度预估，
+  return downloadBytes(ctx, url, maxBytes, debug, '图片', 30_000)
+}
+
+export async function downloadVideo(ctx: Context, url: string, maxBytes: number, debug: DebugLog = () => {}) {
+  return downloadBytes(ctx, url, maxBytes, debug, '视频', 60_000)
+}
+
+function shouldSendAsFile(output: Buffer, options: ImageSendOptions) {
+  if (options.mode === 'file') return true
+  if (options.mode === 'base64') return false
+  return output.length >= options.thresholdKiB * 1024
+}
+
+function shouldSendAsAttachment(output: Buffer, options: ImageSendOptions) {
+  return options.fileThresholdBytes > 0 && output.length > options.fileThresholdBytes
+}
+
+interface PreparedPng {
+  element: h
+  notice?: string
+  directory?: string
+}
+
+function scheduleSendCleanup(directory?: string) {
+  if (!directory) return
+  // 适配器可能在 send 返回后仍异步读取文件，延迟删除。
+  // unref：不要因为这个清理定时器而拖住进程退出。
+  setTimeout(() => {
+    void rm(directory, { recursive: true, force: true })
+  }, 60_000).unref()
+}
+
+async function preparePngMessage(output: Buffer, options: ImageSendOptions, debug: DebugLog, asImageOnly = false): Promise<PreparedPng> {
+  // 合并转发节点里不能用 file 元素：OneBot 会立刻 uploadGroupFile，把该张从图转发里拆出去。
+  const asAttachment = !asImageOnly && shouldSendAsAttachment(output, options)
+  if (!asAttachment && !shouldSendAsFile(output, options)) {
+    debug('以 base64 发送图片', { bytes: output.length, mode: options.mode })
+    return { element: h.image(output, 'image/png') }
+  }
+
+  const directory = await mkdtemp(join(tmpdir(), 'koishi-apng-send-'))
+  const file = join(directory, 'apng.png')
+  await writeFile(file, output)
+  const src = pathToFileURL(file).href
+  debug(asAttachment ? '以文件附件发送' : '以临时文件发送图片', {
+    file,
+    src,
+    bytes: output.length,
+    mode: options.mode,
+    fileThresholdBytes: options.fileThresholdBytes,
+  })
+  if (asAttachment) {
+    const sizeMiB = (output.length / 1024 / 1024).toFixed(1)
+    return {
+      element: h('file', { src, filename: 'apng.png' }),
+      notice: `生成的 APNG 为 ${sizeMiB} MiB，已改为文件发送。`,
+      directory,
+    }
+  }
+  return { element: h.image(src), directory }
+}
+
+/**
+ * 发送 PNG/APNG。大图走 base64 会把整段数据塞进 OneBot WebSocket，容易超时；
+ * 改为写入临时文件后以 file:// 发送，让协议端直接读本地文件。
+ * 超过 fileThresholdBytes 时改为文件附件，而不是聊天图片。
+ * 协议端需要能访问 Koishi 主机上的临时目录（同机或共享挂载）。
+ */
+export async function sendPngImage(session: Session, output: Buffer, options: ImageSendOptions, debug: DebugLog = () => {}) {
+  const prepared = await preparePngMessage(output, options, debug)
+  try {
+    if (prepared.notice) await session.send(prepared.notice)
+    await session.send(prepared.element)
+  } finally {
+    scheduleSendCleanup(prepared.directory)
+  }
+}
+
+/**
+ * 发送多张 APNG。mergeForward 且数量大于 1 时打成一条合并转发，避免刷屏；
+ * 平台不支持或发送失败时退回逐条发送。
+ */
+export async function sendPngImages(session: Session, outputs: Buffer[], options: ImageSendOptions, debug: DebugLog = () => {}, mergeForward = false) {
+  if (!outputs.length) return
+  if (!mergeForward || outputs.length === 1) {
+    for (const output of outputs) await sendPngImage(session, output, options, debug)
+    return
+  }
+
+  const prepared: PreparedPng[] = []
+  try {
+    for (const output of outputs) prepared.push(await preparePngMessage(output, options, debug, true))
+    const botId = String(session.selfId ?? session.bot?.selfId ?? '')
+    const botName = session.bot?.user?.name || 'APNG'
+    const nodes = prepared.map(item => h('message',
+      h('author', { id: botId, name: botName, avatar: session.bot?.user?.avatar }),
+      item.element,
+    ))
+    debug('以合并转发发送多张 APNG', { count: prepared.length })
+    await session.send(h('message', { forward: true }, ...nodes))
+  } catch (error) {
+    debug('合并转发失败，改为逐条发送', error)
+    for (const item of prepared) {
+      try {
+        if (item.notice) await session.send(item.notice)
+        await session.send(item.element)
+      } catch (sendError) {
+        debug('逐条补发失败', sendError)
+      }
+    }
+  } finally {
+    for (const item of prepared) scheduleSendCleanup(item.directory)
+  }
+}
+
+async function downloadBytes(ctx: Context, url: string, maxBytes: number, debug: DebugLog, kind: string, timeout: number) {
+  // Koishi/Satori 可能把消息资源表示成 data URL。先按 base64 长度预估，
   // 可避免在已知超限时仍分配一块巨大的解码 Buffer。
   const dataMatch = /^data:([\w/.+-]+);base64,(.*)$/s.exec(url)
   if (dataMatch) {
     const padding = dataMatch[2].endsWith('==') ? 2 : dataMatch[2].endsWith('=') ? 1 : 0
     const approximateSize = Math.floor(dataMatch[2].length * 3 / 4) - padding
-    debug('下载 data URL', { mime: dataMatch[1], approximateSize, maxBytes })
-    if (approximateSize > maxBytes) throw sizeError(maxBytes)
+    debug('下载 data URL', { mime: dataMatch[1], approximateSize, maxBytes, kind })
+    if (approximateSize > maxBytes) throw sizeError(maxBytes, kind)
     const data = Buffer.from(dataMatch[2], 'base64')
-    if (data.length > maxBytes) throw sizeError(maxBytes)
+    if (data.length > maxBytes) throw sizeError(maxBytes, kind)
     debug('data URL 解码完成', { bytes: data.length })
     return data
   }
 
-  // 用户输入的普通文本 URL 不会进入此函数；这里只下载适配器提供的图片/头像地址。
+  // 用户输入的普通文本 URL 不会进入此函数；这里只下载适配器提供的图片/视频地址。
   // file: 等本地协议不被接受，避免消息触发任意本地文件读取。
-  if (!/^https?:\/\//i.test(url)) throw new ImageInputError('不支持的图片地址')
-  debug('开始 HTTP 下载', { url: summarizeUrl(url), maxBytes })
+  if (!/^https?:\/\//i.test(url)) throw new ImageInputError(`不支持的${kind}地址`)
+  debug('开始 HTTP 下载', { url: summarizeUrl(url), maxBytes, kind })
   try {
     const response = await ctx.http(url, {
       responseType: 'stream',
-      timeout: 30_000,
+      timeout,
     })
     // Content-Length 只能作为快速拒绝依据，服务端可能不提供或谎报，
     // 因此下面仍需在读取每个数据块时累计真实字节数。
@@ -51,7 +178,7 @@ export async function downloadImage(ctx: Context, url: string, maxBytes: number,
       contentType: response.headers.get('content-type'),
       contentLength: response.headers.get('content-length'),
     })
-    if (Number.isFinite(declaredSize) && declaredSize > maxBytes) throw sizeError(maxBytes)
+    if (Number.isFinite(declaredSize) && declaredSize > maxBytes) throw sizeError(maxBytes, kind)
 
     const reader = response.data.getReader()
     const chunks: Buffer[] = []
@@ -63,7 +190,7 @@ export async function downloadImage(ctx: Context, url: string, maxBytes: number,
         size += value.byteLength
         if (size > maxBytes) {
           await reader.cancel()
-          throw sizeError(maxBytes)
+          throw sizeError(maxBytes, kind)
         }
         chunks.push(Buffer.from(value))
       }

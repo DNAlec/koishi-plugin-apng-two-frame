@@ -1,7 +1,9 @@
 const assert = require('node:assert/strict')
+const { writeFile } = require('node:fs/promises')
+const { basename, dirname, join } = require('node:path')
 const { deflateSync, inflateSync } = require('node:zlib')
 const test = require('node:test')
-const { crc32, createTwoFrameApng, encodeTwoFrameApng, encodeTwoFramePngs } = require('../lib')
+const { crc32, createTwoFrameApng, createApngFromVideo, createApngsFromVideo, encodePngFrames, encodeTwoFrameApng, encodeTwoFramePngs, splitVideoSegments } = require('../lib')
 
 function parsePng(buffer) {
   assert.deepEqual(buffer.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
@@ -86,6 +88,151 @@ test('reuses browser-generated PNG streams as two APNG frames', () => {
 test('rejects mismatched browser PNG dimensions', () => {
   const pixel = Buffer.from([0, 0, 0, 255])
   assert.throws(() => encodeTwoFramePngs(staticPng(1, 1, pixel), staticPng(2, 1, Buffer.concat([pixel, pixel]))), /尺寸/)
+})
+
+test('encodes multiple PNG frames with sequential fcTL/fdAT numbers', () => {
+  const pixels = [
+    Buffer.from([255, 0, 0, 255]),
+    Buffer.from([0, 255, 0, 255]),
+    Buffer.from([0, 0, 255, 255]),
+  ]
+  const chunks = parsePng(encodePngFrames(pixels.map(data => ({
+    data: staticPng(1, 1, data),
+    delayNumerator: 125,
+    delayDenominator: 1000,
+  }))))
+  assert.deepEqual(chunks.map(chunk => chunk.type), ['IHDR', 'acTL', 'fcTL', 'IDAT', 'fcTL', 'fdAT', 'fcTL', 'fdAT', 'IEND'])
+  assert.equal(chunks[1].data.readUInt32BE(0), 3)
+  assert.deepEqual(
+    [chunks[2].data.readUInt32BE(0), chunks[4].data.readUInt32BE(0), chunks[5].data.readUInt32BE(0), chunks[6].data.readUInt32BE(0), chunks[7].data.readUInt32BE(0)],
+    [0, 1, 2, 3, 4],
+  )
+  assert.deepEqual([chunks[2].data.readUInt16BE(20), chunks[2].data.readUInt16BE(22)], [125, 1000])
+  assert.deepEqual(rawRows(chunks[3].data, 1, 1), pixels[0])
+  assert.deepEqual(rawRows(chunks[5].data.subarray(4), 1, 1), pixels[1])
+  assert.deepEqual(rawRows(chunks[7].data.subarray(4), 1, 1), pixels[2])
+})
+
+test('requires ffmpeg service for video input', async () => {
+  await assert.rejects(() => createApngFromVideo({}, Buffer.from('not-a-video'), {
+    maxDuration: 10,
+    fps: 8,
+    maxFrames: 48,
+    maxDimension: 512,
+  }), /ffmpeg/)
+})
+
+function mockFfmpeg({ info, frames, thumbnail }) {
+  return {
+    builder() {
+      return {
+        input() { return this },
+        outputOption() { return this },
+        async run(type, path) {
+          if (type === 'info') return Buffer.from(info)
+          if (type === 'file') {
+            const directory = dirname(path)
+            const file = basename(path)
+            if (!file.includes('%04d')) {
+              await writeFile(path, thumbnail || frames[0])
+              return
+            }
+            const prefix = file.replace('%04d.png', '')
+            for (let index = 0; index < frames.length; index++) {
+              await writeFile(join(directory, `${prefix}${String(index + 1).padStart(4, '0')}.png`), frames[index])
+            }
+          }
+        },
+      }
+    },
+  }
+}
+
+test('converts probed video frames from the Koishi ffmpeg service into APNG', async () => {
+  const first = staticPng(1, 1, Buffer.from([255, 0, 0, 255]))
+  const second = staticPng(1, 1, Buffer.from([0, 0, 255, 255]))
+  const output = await createApngFromVideo({
+    ffmpeg: mockFfmpeg({
+      info: 'Duration: 00:00:02.00, start: 0.000000, bitrate: 128 kb/s\nStream #0:0: Video: h264, yuv420p, 64x64, 30 fps',
+      frames: [first, second],
+    }),
+  }, Buffer.from('fake-video'), {
+    maxDuration: 10,
+    fps: 8,
+    maxFrames: 48,
+    maxDimension: 512,
+  })
+  const chunks = parsePng(output)
+  assert.equal(chunks[1].data.readUInt32BE(0), 2)
+  assert.deepEqual(rawRows(chunks[3].data, 1, 1), Buffer.from([255, 0, 0, 255]))
+  assert.deepEqual(rawRows(chunks[5].data.subarray(4), 1, 1), Buffer.from([0, 0, 255, 255]))
+})
+
+test('rejects videos longer than the configured duration', async () => {
+  await assert.rejects(() => createApngFromVideo({
+    ffmpeg: mockFfmpeg({
+      info: 'Duration: 00:00:12.00, start: 0.000000, bitrate: 128 kb/s\nStream #0:0: Video: h264, yuv420p, 64x64, 30 fps',
+      frames: [],
+    }),
+  }, Buffer.from('fake-video'), {
+    maxDuration: 10,
+    fps: 8,
+    maxFrames: 48,
+    maxDimension: 512,
+  }), /时长/)
+})
+
+test('splits an over-limit video into duration-sized APNGs', async () => {
+  assert.deepEqual(splitVideoSegments(12, 10), [
+    { start: 0, length: 10 },
+    { start: 10, length: 2 },
+  ])
+  const first = staticPng(1, 1, Buffer.from([255, 0, 0, 255]))
+  const second = staticPng(1, 1, Buffer.from([0, 0, 255, 255]))
+  const outputs = await createApngsFromVideo({
+    ffmpeg: mockFfmpeg({
+      info: 'Duration: 00:00:12.00, start: 0.000000, bitrate: 128 kb/s\nStream #0:0: Video: h264, yuv420p, 64x64, 30 fps',
+      frames: [first, second],
+    }),
+  }, Buffer.from('fake-video'), {
+    maxDuration: 10,
+    fps: 8,
+    maxFrames: 48,
+    maxDimension: 512,
+    splitOnOverflow: true,
+  })
+  assert.equal(outputs.length, 2)
+  for (const output of outputs) {
+    const chunks = parsePng(output)
+    assert.equal(chunks[1].data.readUInt32BE(0), 2)
+  }
+})
+
+test('prepends the whole-video first frame as thumbnail on each split APNG', async () => {
+  const thumb = staticPng(1, 1, Buffer.from([0, 255, 0, 255]))
+  const first = staticPng(1, 1, Buffer.from([255, 0, 0, 255]))
+  const second = staticPng(1, 1, Buffer.from([0, 0, 255, 255]))
+  const outputs = await createApngsFromVideo({
+    ffmpeg: mockFfmpeg({
+      info: 'Duration: 00:00:12.00, start: 0.000000, bitrate: 128 kb/s\nStream #0:0: Video: h264, yuv420p, 64x64, 30 fps',
+      frames: [first, second],
+      thumbnail: thumb,
+    }),
+  }, Buffer.from('fake-video'), {
+    maxDuration: 10,
+    fps: 8,
+    maxFrames: 48,
+    maxDimension: 512,
+    splitOnOverflow: true,
+    shareThumbnail: true,
+  })
+  assert.equal(outputs.length, 2)
+  for (const output of outputs) {
+    const chunks = parsePng(output)
+    assert.equal(chunks[1].data.readUInt32BE(0), 3)
+    assert.deepEqual([chunks[2].data.readUInt16BE(20), chunks[2].data.readUInt16BE(22)], [10, 1000])
+    assert.deepEqual(rawRows(chunks[3].data, 1, 1), Buffer.from([0, 255, 0, 255]))
+  }
 })
 
 test('requires optional ffmpeg service for GIF input', async () => {
