@@ -3,6 +3,7 @@ import {} from 'koishi-plugin-puppeteer'
 import './ffmpeg'
 import { createTwoFrameApng, DebugLog, downloadImage, downloadVideo, ImageInputError, ImageSendMode, sendPngImage, sendPngImages } from './image'
 import { createApngsFromVideo } from './video'
+import { splitTwoFrameApng } from './apng'
 
 export const name = 'koishi-plugin-apng-two-frame'
 
@@ -14,6 +15,7 @@ export const usage = `
 
 配置项在本说明**下方**。若看不到最新选项，请先编译（\`npm run build\`），再停用后重新启用插件，或重启 Koishi。
 
+- 使用 \`apng.extract\` / \`apng.拆图\` 拆分本插件生成的两帧图片，默认取里图；\`-f 1\` 取表图，\`-a\` 取两帧。不支持视频 APNG。
 - 主指令可用 \`-d\` 指定本次最大像素数。
 - 开启批量子指令后使用 \`apng.batch\` / \`apng.批量\`；\`-n\` 指定本次最多收集的图片数。至少 2 张后发送「开始」，或收满上限后自动生成。
 - 在「视频转换」中开启视频子指令后使用 \`apng.video\` / \`apng.视频\`。参数：\`-t\` 时长、\`-f\` 帧率、\`-F\` 最大帧数、\`-d\` 像素、\`-T\` 共用封面帧。需要任意提供 \`ffmpeg\` 服务的插件。
@@ -35,7 +37,7 @@ export const inject = {
 const aliases = ['两帧', '两帧动图']
 
 export interface Config {
-  /** 主指令名称；批量与视频子指令也会以它作为前缀。 */
+  /** 主指令名称；所有子指令也会以它作为前缀。 */
   commandName: string
   /** 每个输入图片允许下载的最大 MiB 数。 */
   maxFileSize: number
@@ -127,8 +129,11 @@ interface Collection {
    * single 保留原有行为：收满两张立即生成一个结果。
    * batch 则在收满 limit 或用户发送“开始”之前一直保持收集状态。
    * video 只收集一个视频，收到后立即转换。
+   * extract 只收集一张 APNG，收到后立即拆图。
    */
-  mode: 'single' | 'batch' | 'video'
+  mode: 'single' | 'batch' | 'video' | 'extract'
+  /** 拆图输出：默认第二帧，或取第一帧、全部。 */
+  extractFrame?: 1 | 2 | 'all'
   /** 本任务能接收的图片总数；single 固定为 2，batch 取配置值。 */
   limit: number
   /** 每收到一条相关消息就重新开始计时的超时计时器。 */
@@ -515,6 +520,24 @@ async function generateVideo(ctx: Context, session: Session, source: string, con
   }
 }
 
+async function extractApng(ctx: Context, session: Session, source: string, config: Config, frame: 1 | 2 | 'all', debug: DebugLog) {
+  try {
+    const input = await downloadImage(ctx, source, config.maxFileSize * 1024 * 1024, debug)
+    let frames: [Buffer, Buffer]
+    try {
+      frames = splitTwoFrameApng(input, config.maxDimension)
+    } catch (error) {
+      throw new ImageInputError((error as Error).message)
+    }
+    const outputs = frame === 'all' ? frames : [frames[frame - 1]]
+    debug('两帧 APNG 拆分完成', { frame, bytes: outputs.map(output => output.length) })
+    await sendPngImages(session, outputs, sendOptions(config), debug, config.mergeForward)
+  } catch (error) {
+    ctx.logger(name).warn(error)
+    await session.send(error instanceof ImageInputError ? error.message : '拆分两帧 APNG 失败，请检查图片或下载地址。')
+  }
+}
+
 export function apply(ctx: Context, config: Config) {
   // 收集状态只存于内存；机器人重启或插件卸载后不会恢复未完成任务。
   const collections = new Map<string, Collection>()
@@ -632,6 +655,7 @@ export function apply(ctx: Context, config: Config) {
         clear(key)
         debug('收集数量已满，开始生成', { key, mode: collection.mode, sources: collection.sources.map(summarizeSource) })
         if (collection.mode === 'batch') await generateBatch(ctx, session, collection.sources, collection.taskConfig, debug)
+        else if (collection.mode === 'extract') await extractApng(ctx, session, collection.sources[0], collection.taskConfig, collection.extractFrame ?? 2, debug)
         else await generate(ctx, session, collection.sources, collection.taskConfig, debug)
         return false
       }
@@ -691,6 +715,34 @@ export function apply(ctx: Context, config: Config) {
     debug('进入普通收集模式', { key, collected: collection.sources.length, maxDimension: taskConfig.maxDimension })
     return `还需要 ${2 - collection.sources.length} 张图片，请继续发送；发送“取消”可结束任务。`
   })
+
+  ctx.command(`${config.commandName}.extract`, '拆分两帧 APNG，默认取里图')
+    .alias(`${config.commandName}.拆图`)
+    .option('all', '-a 输出表图和里图')
+    .option('frame', '-f <frame:number> 指定帧：1 表图，2 里图')
+    .action(async ({ session, options = {} }) => {
+      if (!session?.userId || !session.channelId) return '当前会话无法收集图片。'
+      const key = collectionKey(session)
+      if (collections.has(key)) return '已有收集任务，请先完成或发送“取消”。'
+      if (options.frame !== undefined && options.frame !== 1 && options.frame !== 2) {
+        return '帧号只能为 1（表图）或 2（里图）。'
+      }
+      if (options.all && options.frame !== undefined) return '-a 和 -f 不能同时使用。'
+      const frame = options.all ? 'all' : (options.frame ?? 2) as 1 | 2
+      const extracted = await extractInitialSources(session, 1, debug)
+      for (const userId of extracted.avatarFailures) await session.send(`无法获取 @${userId} 的头像，已跳过。`)
+      if (extracted.sources.length) {
+        await extractApng(ctx, session, extracted.sources[0], config, frame, debug)
+        return
+      }
+      const collection: Collection = {
+        sources: [], mode: 'extract', limit: 1, extractFrame: frame,
+        timer: undefined as never, queue: Promise.resolve(), session, taskConfig: { ...config },
+      }
+      collections.set(key, collection)
+      resetTimer(key, collection)
+      return '请发送一张本插件生成的两帧 APNG；发送“取消”可结束任务。'
+    })
 
   if (config.enableBatchCommand) {
     // 仅在显式开启配置时注册子指令，关闭时不会占用指令名。
@@ -823,5 +875,5 @@ function overrideBoolean(value: unknown, fallback: boolean) {
 }
 
 export { createTwoFrameApng, downloadImage, downloadVideo, sendPngImage, sendPngImages } from './image'
-export { encodeTwoFrameApng, encodeTwoFramePngs, encodePngFrames, crc32 } from './apng'
+export { encodeTwoFrameApng, encodeTwoFramePngs, encodePngFrames, splitTwoFrameApng, crc32 } from './apng'
 export { createApngFromVideo, createApngsFromVideo, parseFfmpegDuration, chooseVideoFps, splitVideoSegments } from './video'

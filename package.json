@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-apng-two-frame",
-  "version": "1.3.0",
-  "description": "将两张图片合成为两帧 APNG，也可将视频转为 APNG 动图",
+  "version": "1.4.0",
+  "description": "将两张图片合成为两帧 APNG，支持拆图提取里图和视频转 APNG",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -40,8 +40,8 @@
   },
   "koishi": {
     "description": {
-      "zh": "将两张图片合成为两帧 APNG：第一张作缩略图，点开后显示第二张。支持批量生成、视频转 APNG（超时可分割、共用封面帧），以及合并转发发送。",
-      "en": "Combine two images into a two-frame APNG: thumbnail vs opened view. Supports batch generation and converting video to APNG, with optional duration splitting and a shared first-frame thumbnail."
+      "zh": "将两张图片合成为两帧 APNG：第一张作缩略图，点开后显示第二张。支持拆图提取表图或里图、批量生成、视频转 APNG，以及合并转发发送。",
+      "en": "Combine two images into a two-frame APNG, extract either frame, generate in batches, or convert video to APNG with optional splitting and a shared thumbnail."
     },
     "service": {
       "required": [

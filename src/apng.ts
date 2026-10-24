@@ -170,6 +170,61 @@ export function encodeTwoFramePngs(firstInput: Buffer, secondInput: Buffer) {
   ])
 }
 
+/** 拆分本插件生成的两帧图片；不接受视频动画或需要帧合成的 APNG。 */
+export function splitTwoFrameApng(input: Buffer, maxDimension = 16384): [Buffer, Buffer] {
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+  if (input.length < 8 || !input.subarray(0, 8).equals(signature)) {
+    throw new Error('请发送本插件生成的两帧 APNG；静态图片无法恢复里图。')
+  }
+  const expected = ['IHDR', 'acTL', 'fcTL', 'IDAT', 'fcTL', 'fdAT', 'IEND']
+  const chunks: Buffer[] = []
+  let offset = 8
+  for (const type of expected) {
+    if (offset + 12 > input.length) throw new Error('APNG 数据不完整。')
+    const length = input.readUInt32BE(offset)
+    const end = offset + 8 + length
+    if (end + 4 > input.length) throw new Error('APNG 数据不完整。')
+    if (input.toString('ascii', offset + 4, offset + 8) !== type) {
+      throw new Error('仅支持本插件生成的两帧图片，不支持视频 APNG 或其他结构。')
+    }
+    if (crc32(input.subarray(offset + 4, end)) !== input.readUInt32BE(end)) {
+      throw new Error('APNG 校验失败，文件可能已损坏。')
+    }
+    chunks.push(input.subarray(offset + 8, end))
+    offset = end + 4
+  }
+  if (offset !== input.length) throw new Error('APNG 包含多余数据。')
+  const [ihdr, actl, firstControl, firstData, secondControl, secondData, iend] = chunks
+  if (ihdr.length !== 13 || actl.length !== 8 || firstControl.length !== 26
+    || secondControl.length !== 26 || !firstData.length || secondData.length <= 4 || iend.length) {
+    throw new Error('APNG 数据结构无效。')
+  }
+  const width = ihdr.readUInt32BE(0)
+  const height = ihdr.readUInt32BE(4)
+  if (!width || !height || width > maxDimension || height > maxDimension) {
+    throw new Error(`图片尺寸超过限制或无效（最大 ${maxDimension} 像素）。`)
+  }
+  if (!ihdr.subarray(8).equals(Buffer.from([8, 6, 0, 0, 0]))
+    || actl.readUInt32BE(0) !== 2 || actl.readUInt32BE(4) !== 0
+    || secondData.readUInt32BE(0) !== 2) {
+    throw new Error('仅支持本插件生成的两帧图片。')
+  }
+  for (const [index, control] of [firstControl, secondControl].entries()) {
+    if (control.readUInt32BE(0) !== index || control.readUInt32BE(4) !== width
+      || control.readUInt32BE(8) !== height || control.readUInt32BE(12) !== 0
+      || control.readUInt32BE(16) !== 0 || control[24] !== 0 || control[25] !== 0
+      || control.readUInt16BE(20) !== (index === 0 ? 10 : 999)
+      || control.readUInt16BE(22) !== (index === 0 ? 1000 : 1)) {
+      throw new Error('仅支持本插件生成的两帧图片，不支持视频 APNG 或其他帧设置。')
+    }
+  }
+  // 去掉 fdAT 的序号，将原始压缩流重新封装为静态 PNG，不重新编码像素。
+  const png = (data: Buffer) => Buffer.concat([
+    signature, chunk('IHDR', ihdr), chunk('IDAT', data), chunk('IEND'),
+  ])
+  return [png(firstData), png(secondData.subarray(4))]
+}
+
 function compressRgba(frame: RgbaFrame) {
   const rowBytes = frame.width * 4
   const expected = rowBytes * frame.height

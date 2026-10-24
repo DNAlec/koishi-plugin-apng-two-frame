@@ -1,6 +1,6 @@
 # koishi-plugin-apng-two-frame
 
-将两张图片合成为两帧 APNG 的 Koishi 插件，用于聊天列表缩略图与点开后画面不同的趣味效果。也可以批量生成，或把视频转成 APNG 动图。
+将两张图片合成为两帧 APNG 的 Koishi 插件，用于聊天列表缩略图与点开后画面不同的趣味效果。支持拆图提取表图或里图，也可以批量生成，或把视频转成 APNG 动图。
 
 > [!IMPORTANT]
 > 插件生成的是符合规范的 **APNG（PNG 动图）**，不是 JPEG，也不会改成虚假的 `.jpg` 文件名。缩略图效果取决于聊天平台、客户端版本和适配器的图片处理方式。目前主要面向 **QQ + NapCat + OneBot 11**，其他平台可以生成图片，但不保证显示效果一致。
@@ -72,6 +72,23 @@ apng -d 1280 [图片1] [图片2]
 - 在指令中 @群成员，按元素顺序把头像加入输入。`@全体成员` 会被忽略；开头用于唤起机器人的 `@机器人` 视为前缀并跳过。
 
 图片不足两张时进入收集模式，同一用户在同一频道继续发图或 @ 即可补齐。发送完全匹配的 `取消` 可结束任务，超时后自动取消。收集期间重复调用本插件指令不会重置已有任务。
+
+### 拆分两帧图片
+
+无需额外开启配置，使用 `apng.extract` 或 `apng.拆图`：
+
+```text
+apng.extract [APNG图片]        # 默认取里图（第二帧）
+apng.extract -f 1 [APNG图片]   # 只取表图（第一帧）
+apng.extract -f 2 [APNG图片]   # 只取里图
+apng.extract -a [APNG图片]     # 按表图、里图顺序发送两张静态 PNG
+```
+
+可以引用含图消息后发送指令，或先发送指令再补发一张图片；引用图片优先，多张图片只取第一张。等待期间发送完全匹配的「取消」可结束任务，超时自动取消。`-a` 和 `-f` 不能同时使用。子指令前缀跟随 `commandName`。
+
+仅支持本插件两图合成（包括批量模式）生成的两帧 APNG，不支持视频转换结果或其他来源的 APNG 结构。直接复用帧的压缩数据，保留合成后的像素、尺寸和透明度，不重新缩放或压缩；表图原先的缩放、居中和白色补边也会保留，不能恢复上传前的原图文件。
+
+输入沿用 `maxFileSize` 和 `maxDimension` 限制，输出沿用现有图片发送设置；`-a` 时也支持 `mergeForward`。不需要 FFmpeg。若平台已将 APNG 转成静态图，里图数据便已丢失，无法恢复，请尝试发送保留动画数据的原图。
 
 ### 批量生成
 
@@ -190,15 +207,15 @@ npm run dev
 npm test
 ```
 
-测试覆盖 APNG chunk 顺序、CRC、帧延时、多帧编码、浏览器 PNG 数据流复用、FFmpeg 服务缺失降级、消息取图/取视频顺序、指令参数、发送方式（base64 / file:// / 文件附件 / 合并转发）、批量和视频子指令开关，以及并发收集。
+测试覆盖拆帧像素与透明度一致性、损坏文件和视频 APNG 拒绝、拆图指令参数和收集流程，以及 APNG chunk 顺序、CRC、帧延时、多帧编码、浏览器 PNG 数据流复用、FFmpeg 服务缺失降级、消息取图/取视频顺序、指令参数、发送方式（base64 / file:// / 文件附件 / 合并转发）、批量和视频子指令开关，以及并发收集。
 
 ## 发布
 
 仓库通过 GitHub Actions 和 npm Trusted Publishing 自动发布。维护者应先更新 `package.json` 与 `package-lock.json` 中的版本并提交，然后创建完全匹配的 `v<版本号>` 标签：
 
 ```bash
-git tag v1.3.0
-git push origin v1.3.0
+git tag v1.4.0
+git push origin v1.4.0
 ```
 
 Trusted Publisher 配置：GitHub `DNAlec` / `koishi-plugin-apng-two-frame`，工作流 `publish.yml`，允许 `npm publish`。使用 OIDC 短期凭据，不需要 `NPM_TOKEN`。

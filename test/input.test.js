@@ -388,3 +388,60 @@ test('serializes concurrent batch inputs without dropping later images', async (
     await ctx.stop()
   }
 })
+
+test('extract command follows the configured prefix and registers its alias', () => {
+  const ctx = new Context()
+  apply(ctx, config({ commandName: 'tank' }))
+  assert.equal(ctx.$commander.get('tank.拆图')?.name, 'tank.extract')
+  assert.ok(ctx.$commander.get('tank.extract')._options.frame)
+  assert.ok(ctx.$commander.get('tank.extract')._options.all)
+  assert.equal(ctx.$commander.get('apng.extract'), undefined)
+})
+
+test('extracts the inner image by default, supports options, quotes, and follow-up collection', async () => {
+  const { encodeTwoFrameApng, splitTwoFrameApng } = require('../lib')
+  const input = encodeTwoFrameApng(
+    { width: 1, height: 1, data: Buffer.from([255, 0, 0, 255]) },
+    { width: 1, height: 1, data: Buffer.from([0, 0, 255, 128]) },
+  )
+  const frames = splitTwoFrameApng(input)
+  const src = `data:image/png;base64,${input.toString('base64')}`
+  const ctx = new Context()
+  const bot = new TestBot(ctx)
+  const images = []
+  const send = bot.sendMessage.bind(bot)
+  bot.sendMessage = async (channel, content) => {
+    images.push(...h.select(h.normalize(content), 'img').map(item => item.attrs.src))
+    return send(channel, content)
+  }
+  apply(ctx, config())
+  await ctx.start()
+  try {
+    await dispatchMessage(ctx, bot, `apng.extract ${h.image(src)}`, [h.text('apng.extract '), h.image(src)])
+    assert.deepEqual(images.splice(0), [`data:image/png;base64,${frames[1].toString('base64')}`])
+    await dispatchMessage(ctx, bot, `apng.拆图 -f 1 ${h.image(src)}`, [h.text('apng.拆图 -f 1 '), h.image(src)])
+    assert.deepEqual(images.splice(0), [`data:image/png;base64,${frames[0].toString('base64')}`])
+    await dispatchMessage(ctx, bot, 'apng.extract -a', [h.text('apng.extract -a')])
+    await dispatchMessage(ctx, bot, 'apng', [h.text('apng')])
+    assert.match(bot.sent.at(-1), /已有收集任务/)
+    await dispatchMessage(ctx, bot, h.image(src).toString(), [h.image(src)])
+    assert.deepEqual(images.splice(0), frames.map(frame => `data:image/png;base64,${frame.toString('base64')}`))
+    const session = bot.session({
+      type: 'message-created', user: { id: 'user' },
+      channel: { id: 'channel', type: Universal.Channel.Type.DIRECT },
+      message: { id: 'quoted-extract', content: 'apng.extract', elements: [h.text('apng.extract')] },
+    })
+    session.quote = { elements: [h.image(src)] }
+    await ctx.parallel(session, 'message', session)
+    assert.deepEqual(images.splice(0), [`data:image/png;base64,${frames[1].toString('base64')}`])
+    await dispatchMessage(ctx, bot, 'apng.extract -f 3', [h.text('apng.extract -f 3')])
+    assert.match(bot.sent.at(-1), /帧号只能/)
+    await dispatchMessage(ctx, bot, 'apng.extract -a -f 1', [h.text('apng.extract -a -f 1')])
+    assert.match(bot.sent.at(-1), /不能同时使用/)
+    await dispatchMessage(ctx, bot, 'apng.extract', [h.text('apng.extract')])
+    await dispatchMessage(ctx, bot, '取消', [h.text('取消')])
+    assert.match(bot.sent.at(-1), /已取消图片收集/)
+  } finally {
+    await ctx.stop()
+  }
+})

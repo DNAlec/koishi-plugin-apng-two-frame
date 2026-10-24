@@ -239,3 +239,53 @@ test('requires optional ffmpeg service for GIF input', async () => {
   const gif = Buffer.from('GIF89a', 'ascii')
   await assert.rejects(() => createTwoFrameApng({}, gif, gif, 4096), /ffmpeg/)
 })
+
+const { splitTwoFrameApng } = require('../lib')
+
+test('splits both encoder outputs into exact static PNG pixels and valid CRCs', () => {
+  const first = { width: 2, height: 1, data: Buffer.from([255, 0, 0, 255, 1, 2, 3, 0]) }
+  const second = { width: 2, height: 1, data: Buffer.from([0, 0, 255, 128, 4, 5, 6, 255]) }
+  for (const input of [
+    encodeTwoFrameApng(first, second),
+    encodeTwoFramePngs(staticPng(2, 1, first.data), staticPng(2, 1, second.data)),
+  ]) {
+    const outputs = splitTwoFrameApng(input)
+    for (const [index, output] of outputs.entries()) {
+      const chunks = parsePng(output)
+      assert.deepEqual(chunks.map(item => item.type), ['IHDR', 'IDAT', 'IEND'])
+      assert.deepEqual(rawRows(chunks[1].data, 2, 1), [first, second][index].data)
+      for (const item of chunks) assert.equal(item.storedCrc, crc32(Buffer.concat([Buffer.from(item.type), item.data])))
+    }
+  }
+})
+
+test('rejects static, truncated, corrupt, oversized, and video APNG inputs', () => {
+  const png = staticPng(1, 1, Buffer.from([1, 2, 3, 255]))
+  const input = encodeTwoFramePngs(png, png)
+  assert.throws(() => splitTwoFrameApng(png), /仅支持/)
+  assert.throws(() => splitTwoFrameApng(Buffer.from('jpeg')), /静态图片/)
+  for (let end = 8; end < input.length; end++) {
+    assert.throws(() => splitTwoFrameApng(input.subarray(0, end)), /不完整/)
+  }
+  const corrupt = Buffer.from(input)
+  corrupt[20] ^= 1
+  assert.throws(() => splitTwoFrameApng(corrupt), /校验失败/)
+  assert.throws(() => splitTwoFrameApng(input, 0), /尺寸/)
+  assert.throws(() => splitTwoFrameApng(Buffer.concat([input, Buffer.from([0])])), /多余/)
+  for (const count of [1, 2, 3]) {
+    const video = encodePngFrames(Array.from({ length: count }, () => ({ data: png, delayNumerator: 100, delayDenominator: 1000 })))
+    assert.throws(() => splitTwoFrameApng(video), /仅支持/)
+  }
+})
+
+test('rejects altered frame controls even with correct CRCs', () => {
+  const png = staticPng(1, 1, Buffer.from([1, 2, 3, 255]))
+  for (const position of [0, 4, 8, 12, 16, 20, 22, 24, 25]) {
+    const chunks = parsePng(encodeTwoFramePngs(png, png))
+    const control = Buffer.from(chunks[4].data)
+    control[position] ^= 1
+    chunks[4].data = control
+    const input = Buffer.concat([png.subarray(0, 8), ...chunks.map(item => pngChunk(item.type, item.data))])
+    assert.throws(() => splitTwoFrameApng(input), /仅支持/)
+  }
+})
